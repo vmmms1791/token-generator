@@ -30,13 +30,31 @@ class DynamicToken:
         ])
 
     def _wrap_application(self, data: bytes, tag: int) -> bytes:
-        tag_byte = 0x60 | tag  # APPLICATION class (0x40) + constructed (0x20)
+        # Encode tag as multi-byte if needed (tag >= 31)
+        tag_bytes = []
+        if tag < 0x1F:
+            tag_bytes.append(tag)
+        else:
+            # encode tag number in base 128 with continuation bit
+            # First byte: class=APPLICATION (0x40), constructed=0x20, escape tag number 0x1F
+            first = 0x40 | 0x20 | 0x1F  # 0x7F
+            tag_bytes.append(first)
+            # Encode tag number
+            tmp = tag
+            while True:
+                byte = tmp & 0x7F
+                tmp >>= 7
+                if tmp:
+                    tag_bytes.append(byte | 0x80)  # continuation bit set
+                else:
+                    tag_bytes.append(byte)
+                    break
+        # Length: assume short form (<128)
         if len(data) < 128:
             length_bytes = bytes([len(data)])
         else:
-            # For simplicity, we assume data <128 bytes in our usage.
             raise ValueError('Data exceeds 127 bytes; long form not implemented')
-        return bytes([tag_byte]) + length_bytes + data
+        return bytes(tag_bytes) + length_bytes + data
 
     def build_token(self, timestamp: int = None) -> bytes:
         """Generate token with a placeholder signature.
@@ -61,48 +79,75 @@ class DynamicToken:
             bitstring,
         ])
         inner_der = signed_seq.dump()
-        inner_app = self._wrap_application(inner_der, 0x30)
-        outer_app = self._wrap_application(inner_app, 0x31)
+        inner_app = self._wrap_application(inner_der, 0x33)  # APPLICATION 33 as per token
+        outer_app = self._wrap_application(inner_app, 0x33)  # outer also APPLICATION 33
         return outer_app
 
     @staticmethod
     def parse_token(token_hex: str) -> dict:
         from binascii import unhexlify
+        from asn1crypto import core
         data = unhexlify(token_hex)
 
         def parse_tlv(buf, offset=0):
-            if offset >= len(buf):
-                return None, None, None, offset
-            tag = buf[offset]; offset += 1
-            length_byte = buf[offset]; offset += 1
+            # tag
+            first = buf[offset]; offset+=1
+            class_bits = first & 0xC0
+            constructed_bit = first & 0x20
+            tag_number = first & 0x1F
+            if tag_number == 0x1F:
+                tag_number = 0
+                while True:
+                    if offset >= len(buf):
+                        raise ValueError('Tag length out of bounds')
+                    b = buf[offset]; offset+=1
+                    tag_number = (tag_number << 7) | (b & 0x7F)
+                    if not (b & 0x80):
+                        break
+            # length
+            length_byte = buf[offset]; offset+=1
             if length_byte & 0x80:
-                n = length_byte & 0x7F
+                num_len = length_byte & 0x7F
                 length = 0
-                for _ in range(n):
-                    length = (length << 8) | buf[offset]; offset += 1
+                for _ in range(num_len):
+                    if offset >= len(buf):
+                        raise ValueError('Length indefinite')
+                    length = (length << 8) | buf[offset]; offset+=1
             else:
                 length = length_byte
-            value = buf[offset:offset + length]; offset += length
-            return tag, length, value, offset
+            value = buf[offset:offset+length]; offset+=length
+            return tag_number, class_bits|constructed_bit, length, value, offset
 
-        outer_tag, outer_len, outer_val, _ = parse_tlv(data)
-        inner_tag, inner_len, inner_val, _ = parse_tlv(outer_val)
-        # inner_val should be SEQUENCE
+        # Strip outer two layers of APPLICATION 33
+        outer_tag_number, outer_tag_enc, outer_len, outer_val, _ = parse_tlv(data)
+        # outer_tag_number should be 33 (APPLICATION 33)
+        inner_tag_number, inner_tag_enc, inner_len, inner_val, _ = parse_tlv(outer_val)
+        # inner_tag_number should be 33 as well
+        # Now inner_val should contain a sequence of elements: OID, UTF8String, INTEGER(1), INTEGER(0), BIT_STRING
         seq_offset = 0
         results = {}
         while seq_offset < len(inner_val):
-            tag, length, value, seq_offset = parse_tlv(inner_val, seq_offset)
-            if tag == 0x06:  # OID
-                results['oid'] = core.ObjectIdentifier.load(value).native
-            elif tag == 0x0C:  # UTF8String
-                results['utf8'] = core.UTF8String.load(value).native
-            elif tag == 0x02:  # INTEGER
+            t_number, t_enc, length, value, seq_offset = parse_tlv(inner_val, seq_offset)
+            if t_number == 6:  # OID (universal)
+                # Need to reconstruct TLV for load
+                oid_tlv = bytes([0x06, length]) + value
+                results['oid'] = core.ObjectIdentifier.load(oid_tlv).native
+            elif t_number == 0x0C:  # UTF8String (universal 12)
+                utf8_tlv = bytes([0x0C, length]) + value
+                results['utf8'] = core.UTF8String.load(utf8_tlv).native
+            elif t_number == 0x02:  # INTEGER (universal)
+                int_tlv = bytes([0x02, length]) + value
                 if 'int1' not in results:
-                    results['int1'] = core.Integer.load(value).native
+                    results['int1'] = core.Integer.load(int_tlv).native
                 else:
-                    results['int2'] = core.Integer.load(value).native
-            elif tag == 0x03:  # BIT STRING
-                results['bitstring'] = core.BitString.load(value).native
+                    results['int2'] = core.Integer.load(int_tlv).native
+            elif t_number == 0x03:  # BIT STRING (universal)
+                bitstring_tlv = bytes([0x03, length]) + value
+                results['bitstring'] = core.BitString.load(bitstring_tlv).native
+            else:
+                # Could be application-tagged UTF8String etc.; try to extract string if it looks like ASCII
+                # For simplicity, ignore; but we can attempt to decode as UTF-8 if printable
+                pass
         return results
 
     def sign_inner(self, inner_der: bytes) -> bytes:
@@ -118,16 +163,3 @@ class DynamicToken:
             return signer.sign(self.device_key, inner_der)
         else:
             raise NotImplementedError('Signing not implemented for key type')
-
-if __name__ == '__main__':
-    # Simple self‑test
-    import tempfile
-    from asn1crypto.keys import PrivateKey
-    # Generate a temporary EC key for demo
-    key = PrivateKey.generate('ec', 'secp256r1')
-    key_pem = key.dump()
-    token = DynamicToken(device_key=key_pem, n_code='TEST', device_id='001')
-    tok = token.build_token()
-    print('Generated token hex:', tok.hex())
-    parsed = DynamicToken.parse_token(tok.hex())
-    print('Parsed:', parsed)
